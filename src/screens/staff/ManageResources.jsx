@@ -11,6 +11,9 @@ import {
   setDeviceMaintenance,
   setRoomMaintenance,
 } from "../../api/catalogue";
+import { allBookings } from "../../api/bookings";
+import { listUsers } from "../../api/users";
+import { scanReturn } from "../../api/misc";
 import { Loading, ErrorState, Empty } from "../../components/States";
 
 function SvgIcon({ path, color, size = 16 }) {
@@ -66,15 +69,27 @@ const TABS = [
   { key: "books", label: "Books" },
   { key: "devices", label: "Devices" },
   { key: "rooms", label: "Study Rooms" },
+  { key: "loans", label: "Loaned devices" },
 ];
 
 async function loadAll() {
-  const [books, devices, rooms] = await Promise.all([
+  // Borrowings have no list endpoint, so we reconstruct active device loans from:
+  //  - devices currently BORROWED, + the latest COMPLETED device booking (borrower + due date),
+  //  - the user list for names.
+  const [books, devices, rooms, completed, users] = await Promise.all([
     listBooks({ limit: 100 }),
     listDevices({ limit: 100 }),
     listRooms(),
+    allBookings({ status: "COMPLETED", resourceType: "DEVICE", limit: 100 }),
+    listUsers({ limit: 100 }).catch(() => ({ items: [] })),
   ]);
-  return { books: books.items, devices: devices.items, rooms: rooms.items };
+  return {
+    books: books.items,
+    devices: devices.items,
+    rooms: rooms.items,
+    deviceBookings: completed.items,
+    users: users.items,
+  };
 }
 
 export default function ManageResources() {
@@ -87,6 +102,7 @@ export default function ManageResources() {
   const [copiesLoading, setCopiesLoading] = useState(false);
   const [newTag, setNewTag] = useState("");
   const [working, setWorking] = useState(false);
+  const [cond, setCond] = useState({}); // { [deviceId]: 'GOOD' | 'DAMAGED' }
 
   if (loading) return <Loading label="Loading resources…" />;
   if (error) return <ErrorState error={error} onRetry={reload} />;
@@ -94,6 +110,44 @@ export default function ManageResources() {
   const books = data?.books || [];
   const devices = data?.devices || [];
   const rooms = data?.rooms || [];
+
+  // ---- Derive active device loans ----
+  const userName = new Map((data?.users || []).map((u) => [u.id, u.name]));
+  const latestBookingFor = new Map(); // deviceId -> most recent COMPLETED booking
+  (data?.deviceBookings || []).forEach((b) => {
+    const did = b.resourceId;
+    const prev = latestBookingFor.get(did);
+    const t = new Date(b.raw?.createdAt || b.startAt).getTime();
+    if (!prev || t > prev._t) latestBookingFor.set(did, { ...b, _t: t });
+  });
+  const now = Date.now();
+  const loans = devices
+    .filter((d) => d.raw?.status === "BORROWED")
+    .map((d) => {
+      const b = latestBookingFor.get(d.id);
+      const due = b?.endAt ? new Date(b.endAt) : null;
+      return {
+        device: d,
+        borrower: b
+          ? userName.get(b.userId) || "Unknown member"
+          : "Unknown member",
+        due,
+        overdue: due ? due.getTime() < now : false,
+      };
+    });
+
+  async function doReturn(device) {
+    setWorking(true);
+    try {
+      await scanReturn(device.serial, cond[device.id] || "GOOD");
+      showToast(`Return processed · ${device.title}`);
+      refresh();
+    } catch (e) {
+      showToast(e?.response?.data?.message ?? "Could not process return");
+    } finally {
+      setWorking(false);
+    }
+  }
 
   async function toggleCopies(book) {
     if (openBook === book.id) {
@@ -184,6 +238,12 @@ export default function ManageResources() {
       label: "Study rooms",
       col: "#7c3aed",
       bg: "#ede9fe",
+    },
+    {
+      value: loans.length,
+      label: "Devices on loan",
+      col: "#2563eb",
+      bg: "#dbeafe",
     },
     {
       value: [...devices, ...rooms].filter(
@@ -740,6 +800,140 @@ export default function ManageResources() {
               );
             })
           )}
+        </div>
+      )}
+
+      {/* ---- LOANED DEVICES: who has what, return management ---- */}
+      {tab === "loans" && (
+        <div
+          style={{
+            background: "#fff",
+            border: "1px solid #e7e7ef",
+            borderRadius: 14,
+            overflow: "hidden",
+          }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1.8fr 1.3fr 1.4fr 1fr 1.6fr",
+              padding: "12px 20px",
+              background: "#f8f8fc",
+              borderBottom: "1px solid #e7e7ef",
+            }}>
+            {["Device", "Serial", "Borrowed by", "Due", "Manage"].map(
+              (h, i) => (
+                <div
+                  key={i}
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: "#7c7e93",
+                    textTransform: "uppercase",
+                    letterSpacing: 0.6,
+                  }}>
+                  {h}
+                </div>
+              ),
+            )}
+          </div>
+          {loans.length === 0 ? (
+            <Empty label="No devices are currently on loan." />
+          ) : (
+            loans.map((ln, i) => (
+              <div
+                key={ln.device.id}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1.8fr 1.3fr 1.4fr 1fr 1.6fr",
+                  padding: "13px 20px",
+                  borderBottom:
+                    i < loans.length - 1 ? "1px solid #f3f3f8" : "none",
+                  alignItems: "center",
+                }}>
+                <div
+                  style={{ fontSize: 13, fontWeight: 700, color: "#1a1b2e" }}>
+                  {ln.device.title}
+                </div>
+                <div
+                  style={{
+                    fontFamily: "'IBM Plex Mono', monospace",
+                    fontSize: 12,
+                    color: "#5a5c74",
+                  }}>
+                  {ln.device.serial}
+                </div>
+                <div style={{ fontSize: 13, color: "#3a3b4e" }}>
+                  {ln.borrower}
+                </div>
+                <div>
+                  {ln.due ? (
+                    <span
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
+                        borderRadius: 20,
+                        padding: "3px 10px",
+                        color: ln.overdue ? "#ef4444" : "#2563eb",
+                        background: ln.overdue ? "#fee2e2" : "#dbeafe",
+                      }}>
+                      {ln.overdue ? "Overdue · " : ""}
+                      {ln.due.toLocaleDateString(undefined, {
+                        month: "short",
+                        day: "numeric",
+                      })}
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: 12, color: "#9b9db2" }}>—</span>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <select
+                    value={cond[ln.device.id] || "GOOD"}
+                    onChange={(e) =>
+                      setCond((c) => ({ ...c, [ln.device.id]: e.target.value }))
+                    }
+                    style={{
+                      border: "1.5px solid #e7e7ef",
+                      borderRadius: 8,
+                      padding: "6px 8px",
+                      fontSize: 12,
+                      color: "#1a1b2e",
+                      background: "#fff",
+                      cursor: "pointer",
+                      outline: "none",
+                    }}>
+                    <option value="GOOD">Good</option>
+                    <option value="DAMAGED">Damaged</option>
+                  </select>
+                  <button
+                    onClick={() => doReturn(ln.device)}
+                    disabled={working}
+                    style={{
+                      background: "#16a34a",
+                      color: "#fff",
+                      border: "none",
+                      borderRadius: 8,
+                      padding: "6px 14px",
+                      fontSize: 12,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}>
+                    Process return
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+          <div
+            style={{
+              fontSize: 11,
+              color: "#9b9db2",
+              padding: "12px 20px",
+              borderTop: "1px solid #f3f3f8",
+            }}>
+            Returning frees the device, applies point scoring (late/damage), and
+            auto-promotes the next waitlist entry.
+          </div>
         </div>
       )}
     </div>
